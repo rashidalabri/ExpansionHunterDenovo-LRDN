@@ -1,0 +1,8 @@
+name: ehdn-lrdn
+channels:
+  - defaults
+dependencies:
+  - pysamstats
+  - pandas
+  - ca-certificates
+  - openssl
