@@ -1,14 +1,15 @@
 #!/usr/bin/env python
 # coding: utf-8
+
 import argparse
-import pandas as pd
-from pathlib import Path
-import pysam
-import pysamstats
-import numpy as np
 import json
-from typing import Tuple
 import pickle
+import subprocess
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
 
 
 class Locus(object):
@@ -24,11 +25,11 @@ class Locus(object):
 
     def __eq__(self, other: object) -> bool:
         return (
-            hasattr(other, "chrom")
+            hasattr(other, "contig")
             and hasattr(other, "start")
             and hasattr(other, "end")
             and hasattr(other, "motif")
-            and self.contig == other.chrom
+            and self.contig == other.contig
             and self.start == other.start
             and self.end == other.end
             and self.motif == other.motif
@@ -38,16 +39,24 @@ class Locus(object):
         return hash((self.contig, self.start, self.end, self.motif))
 
     def __str__(self) -> str:
-        return f"Locus<{self.contig}:{self.start}-{self.end}, {self.motif}>"
+        return f"{self.contig}:{self.start}-{self.end}"
 
     def __repr__(self) -> str:
-        return self.__str__()
+        return f"Locus({self.contig}:{self.start}-{self.end};{self.motif})"
 
 
 class Sample(object):
-    def __init__(self, name: str):
+    def __init__(self, name: str, alignment: Path, profile: Path):
         self.name = name
+        self.alignment = alignment
+        self.profile = profile
         self.loci_counts = dict()
+
+    @property
+    def global_depth(self) -> float:
+        with open(self.profile, "r") as f:
+            profile = json.load(f)
+        return profile["Depth"]
 
     def build_loci_from_calls(self, calls: pd.DataFrame) -> None:
         for _, row in calls.iterrows():
@@ -68,17 +77,9 @@ class Sample(object):
 
 
 class LocalReadDepthNormalizer(object):
-    def __init__(
-        self,
-        sample: Sample,
-        reads: pysam.AlignmentFile,
-        global_depth: float,
-        padding: int,
-    ):
+    def __init__(self, sample: Sample, padding: int):
         self.sample = sample
         self.padding = padding
-        self.reads = reads
-        self.global_depth = global_depth
 
     def normalize_sample(self) -> None:
         for locus, count in self.sample.loci_counts.items():
@@ -86,14 +87,20 @@ class LocalReadDepthNormalizer(object):
             self.sample.loci_counts[locus] = local_normalized_count
 
     def pad_locus(self, locus: Locus) -> Tuple[int, int]:
-        return locus.start - self.padding, locus.end + self.padding
+        return max(0, locus.start - self.padding), locus.end + self.padding
 
     def get_locus_local_depth(self, locus: Locus) -> float:
-        padded_start, padded_end = self.pad_locus(locus)
-        local_coverage = pysamstats.load_coverage(
-            self.reads, chrom=locus.contig, start=padded_start, end=padded_end
-        )
-        return np.mean(local_coverage.reads_all)
+        start_padded, stop_padded = self.pad_locus(locus)
+        region = f"{locus.contig}:{start_padded}-{stop_padded}"
+        samtools_cmd = ["samtools", "depth", "-r", region, str(self.sample.alignment)]
+        awk_cmd = ["awk", "{d+=$3}END{print d}"]
+
+        ps = subprocess.Popen(samtools_cmd, stdout=subprocess.PIPE)
+        result = subprocess.check_output(awk_cmd, stdin=ps.stdout)
+        ps.wait()
+        total_read_depth = int(result.strip())
+
+        return total_read_depth / (stop_padded - start_padded)
 
     def normalize_locus_count(self, locus: Locus, count: float) -> float:
         """Normalizes a locus' Anchored IRR count by the local read depth.
@@ -117,7 +124,7 @@ class LocalReadDepthNormalizer(object):
             float: The locally normalized Anchored IRR count.
         """
         local_depth = self.get_locus_local_depth(locus)
-        return count * self.global_depth / local_depth
+        return count * self.sample.global_depth / local_depth
 
 
 class Parameters(object):
@@ -126,16 +133,19 @@ class Parameters(object):
 
     @property
     def sample_name(self) -> str:
-        return self.args.sample_name
+        return self.args.name
 
     @property
     def ehdn_calls_df(self) -> pd.DataFrame:
         return pd.read_table(self.args.calls)
 
     @property
-    def alignment_file(self) -> pysam.AlignmentFile:
-        with open(self.args.reads, "rb") as f:
-            return pysam.AlignmentFile(f)
+    def alignment(self) -> Path:
+        return self.args.alignment
+
+    @property
+    def profile(self) -> str:
+        return self.args.profile
 
     @property
     def global_depth(self) -> float:
@@ -147,57 +157,53 @@ class Parameters(object):
     def padding(self) -> int:
         return self.args.padding
 
+    @property
+    def output_dir(self) -> int:
+        return self.args.output_dir
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Normalize EHDN calls to local read depth."
+        description="Normalize EHDN repeat expansion calls to sample local read depth."
     )
     parser.add_argument(
-        "-r",
-        "--reads",
-        required=True,
+        "alignment",
         type=Path,
         help="Alignment file to use for normalization (BAM, CRAM, SAM).",
     )
     parser.add_argument(
-        "-s",
-        "--sample_name",
+        "name",
         type=str,
-        required=True,
         help="The name of the sample to normalize.",
     )
     parser.add_argument(
-        "-c",
-        "--calls",
+        "calls",
         type=Path,
-        required=True,
-        help="The path to the EHDN calls file.",
+        help="The path to the EHDN repeat expansion calls file.",
     )
     parser.add_argument(
-        "-p",
-        "--profile",
+        "profile",
         type=Path,
-        required=True,
         help="Path to the STR profile associated with the sample.",
     )
     parser.add_argument(
-        "-w",
+        "-p",
         "--padding",
         type=int,
         default=1000,
         help="The number of basepairs to pad around each locus.",
     )
-
-    args = parser.parse_args()
-    parameters = Parameters(args)
-
-    sample = Sample(parameters.sample_name)
-    sample.build_loci_from_calls(parameters.ehdn_calls_df)
-    normalizer = LocalReadDepthNormalizer(
-        sample, parameters.alignment_file, parameters.global_depth, parameters.padding
+    parser.add_argument(
+        "output_dir", type=Path, help="The directory to save the output"
     )
+
+    params = Parameters(parser.parse_args())
+
+    sample = Sample(params.sample_name, params.alignment, params.profile)
+    sample.build_loci_from_calls(params.ehdn_calls_df)
+    normalizer = LocalReadDepthNormalizer(sample, params.padding)
     normalizer.normalize_sample()
-    sample.save_to_file(parameters.sample_name + ".pkl")
+    sample.save_to_file(params.output_dir / (params.sample_name + ".pkl"))
 
 
 if __name__ == "__main__":
