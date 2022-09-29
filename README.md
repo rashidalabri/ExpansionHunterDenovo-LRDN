@@ -18,7 +18,7 @@ First, run the `ehdn_lrdn.py` script on each sample:
 $ python ehdn_lrdn.py case_sample1.bam case_sample1 ehdn_output.tsv case_sample1.str_profile.json lrdn_output_dir/
 ```
 
-Then, run the merge script:
+After running the above script on all samples, run the merge script:
 
 ```
 $ python merge_lrdn_output.py lrdn_output_dir/ lrdn_output.tsv
